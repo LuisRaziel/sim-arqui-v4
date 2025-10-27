@@ -6,14 +6,9 @@ using Microsoft.Extensions.Caching.Memory;
 using Serilog;
 using Serilog.Context;
 using System.Globalization;
-
-// ===== Logs JSON compactos =====
-Log.Logger = new LoggerConfiguration()
-    .Enrich.FromLogContext()
-    .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
-    .CreateLogger();
-
-Serilog.Log.Information("worker_starting");
+using Microsoft.AspNetCore.Builder;  // <-- para WebApplication, MapGet, MapMetrics
+using Microsoft.AspNetCore.Http;     // <-- para Results
+using Prometheus;  
 
 // ===== Config por entorno =====
 var host       = Environment.GetEnvironmentVariable("RABBITMQ__HOST") ?? "localhost";
@@ -21,6 +16,48 @@ var user       = Environment.GetEnvironmentVariable("RABBITMQ__USER") ?? "guest"
 var pass       = Environment.GetEnvironmentVariable("RABBITMQ__PASS") ?? "guest";
 var prefetch   = int.TryParse(Environment.GetEnvironmentVariable("WORKER__PREFETCH"), out var p) ? p : 10;
 var maxRetries = int.TryParse(Environment.GetEnvironmentVariable("WORKER__RETRYCOUNT"), out var r) ? r : 3;
+
+// ===== Logs JSON compactos =====
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
+    .CreateLogger();
+    
+Serilog.Log.Information("worker_starting");
+
+var ordersProcessedTotal = Metrics.CreateCounter("orders_processed_total", "Órdenes procesadas por el worker");
+var ordersFailedTotal    = Metrics.CreateCounter("orders_failed_total", "Órdenes enviadas a DLQ");
+
+// ===== Health + Métricas HTTP (puerto 8081) =====
+var healthBuilder = WebApplication.CreateBuilder();
+var healthApp = healthBuilder.Build();
+
+// Liveness: el proceso está vivo
+healthApp.MapGet("/live", () => Results.Ok(new { status = "alive" }));
+
+// Readiness: verifica conexión a RabbitMQ
+healthApp.MapGet("/health", () =>
+{
+    try
+    {
+        var factory = new ConnectionFactory { HostName = host, UserName = user, Password = pass };
+        using var conn = factory.CreateConnection();
+        using var ch = conn.CreateModel();
+        return Results.Ok(new { status = "ready", broker = "connected" });
+    }
+    catch (Exception ex)
+    {
+        Serilog.Log.Warning(ex, "health_check_failed");
+        return Results.Json(new { status = "unhealthy", broker = "disconnected", error = ex.Message }, statusCode: 503);
+    }
+});
+
+// Exponer /metrics en el mismo servidor
+healthApp.MapMetrics();
+
+// Ejecuta el servidor de health/metrics en segundo plano
+_ = Task.Run(() => healthApp.Run("http://0.0.0.0:8081"));
+Serilog.Log.Information("worker_health_endpoint_started port=8081");
 
 const string exchange    = "orders.exchange";
 const string routingKey  = "orders.created";
@@ -141,6 +178,7 @@ while (true)
                         {
                             Serilog.Log.Warning("invalid_payload_orderId_parse_error {Raw}", raw);
                             ch.BasicAck(ea.DeliveryTag, false);
+                            
                             return;
                         }
                     }
@@ -148,6 +186,7 @@ while (true)
                     {
                         Serilog.Log.Warning("invalid_payload_missing_orderId {Body}", json);
                         ch.BasicAck(ea.DeliveryTag, false);
+                        
                         return;
                     }
 
@@ -166,6 +205,7 @@ while (true)
                         {
                             Serilog.Log.Warning("invalid_payload_amount_parse_error {OrderId} {Raw}", orderId, amountEl.ToString());
                             ch.BasicAck(ea.DeliveryTag, false);
+                            
                             return;
                         }
                     }
@@ -173,6 +213,7 @@ while (true)
                     {
                         Serilog.Log.Warning("invalid_payload_missing_amount {OrderId}", orderId);
                         ch.BasicAck(ea.DeliveryTag, false);
+                        
                         return;
                     }
 
@@ -184,6 +225,7 @@ while (true)
                     {
                         Serilog.Log.Information("duplicate_ignored {Key}", key);
                         ch.BasicAck(ea.DeliveryTag, false);
+                        
                         return;
                     }
 
@@ -191,6 +233,7 @@ while (true)
                     await Task.Delay(20);
 
                     ch.BasicAck(ea.DeliveryTag, false);
+                    ordersProcessedTotal.Inc();
                     Serilog.Log.Information("order_processed {OrderId}", orderId);
                 }
             }
@@ -202,6 +245,7 @@ while (true)
                 {
                     Serilog.Log.Error(ex, "worker_error_to_dlq {Retry}", retries + 1);
                     ch.BasicReject(ea.DeliveryTag, requeue: false); // a DLQ
+                    ordersFailedTotal.Inc();
                 }
                 else
                 {
@@ -213,7 +257,7 @@ while (true)
 
                     // Re-publica y ACKea el original
                     ch.BasicPublish(exchange, routingKey, props, ea.Body);
-                    ch.BasicAck(ea.DeliveryTag, false);
+                    ch.BasicAck(ea.DeliveryTag, false);                    
                     Serilog.Log.Error(ex, "worker_error_retrying {Retry}", retries + 1);
                 }
             }

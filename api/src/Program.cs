@@ -9,6 +9,7 @@ using System.Security.Claims;
 using System.Text;
 using Serilog;
 using Api.Middleware;
+using Prometheus;
 
 // Logs JSON compactos (listos para ELK/DataDog)
 Log.Logger = new LoggerConfiguration()
@@ -65,6 +66,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
+var ordersPublishedTotal = Metrics.CreateCounter("orders_published_total", "Órdenes publicadas por la API");
 var app = builder.Build();
 
 app.UseSwagger();
@@ -72,6 +74,8 @@ app.UseSwaggerUI();
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseHttpMetrics();          // métricas de peticiones HTTP
+app.MapMetrics("/metrics");    // endpoint de scrape para Prometheus
 
 // Health
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
@@ -136,6 +140,7 @@ app.MapPost("/orders",
 
     Serilog.Log.Information("order_received {OrderId} {Amount}", req.OrderId, req.Amount);
     ch.BasicPublish("orders.exchange", "orders.created", props, body);
+    ordersPublishedTotal.Inc();
     Serilog.Log.Information("order_published {OrderId}", req.OrderId);
 
     return Results.Accepted($"/orders/{req.OrderId}", new { status = "queued", req.OrderId });
