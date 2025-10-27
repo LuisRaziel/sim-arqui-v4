@@ -3,6 +3,15 @@ using RabbitMQ.Client.Events;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Memory;
+using Serilog;
+
+// Logs JSON compactos
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
+    .CreateLogger();
+
+Serilog.Log.Information("worker_starting");
 
 var host = Environment.GetEnvironmentVariable("RABBITMQ__HOST") ?? "localhost";
 var user = Environment.GetEnvironmentVariable("RABBITMQ__USER") ?? "guest";
@@ -64,13 +73,15 @@ while (true)
                 var orderId = root.GetProperty("orderId").GetGuid().ToString();
                 var amount  = root.GetProperty("amount").GetDecimal();
 
+                Serilog.Log.Information("order_processing {OrderId} {Amount}", orderId, amount);
+
                 var key = ea.BasicProperties?.MessageId ?? orderId;
                 if (!TryMark(key)) { ch.BasicAck(ea.DeliveryTag, false); return; }
 
                 await Task.Delay(20); // simula trabajo
                 ch.BasicAck(ea.DeliveryTag, false);
             }
-            catch
+            catch (Exception ex)
             {
                 var retries = 0;
                 if (ea.BasicProperties?.Headers != null &&
@@ -82,6 +93,7 @@ while (true)
 
                 if (retries + 1 >= maxRetries)
                 {
+                    Serilog.Log.Error(ex, "worker_error_retrying {Retry}", retries);
                     ch.BasicReject(ea.DeliveryTag, requeue: false); // a DLQ
                 }
                 else
@@ -103,5 +115,6 @@ while (true)
     catch
     {
         await Task.Delay(3000); // reconexión
+        Serilog.Log.Warning("worker_error_to_dlq {DeliveryTag}");
     }
 }
