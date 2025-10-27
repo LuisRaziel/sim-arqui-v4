@@ -10,6 +10,8 @@ using System.Text;
 using Serilog;
 using Api.Middleware;
 using Prometheus;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
 
 // Logs JSON compactos (listos para ELK/DataDog)
 Log.Logger = new LoggerConfiguration()
@@ -66,6 +68,21 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
+var permitLimit  = int.TryParse(builder.Configuration["RATELIMIT__PERMIT_LIMIT"], out var pl) ? pl : 20;
+var windowSecs   = int.TryParse(builder.Configuration["RATELIMIT__WINDOW_SECONDS"], out var ws) ? ws : 10;
+
+builder.Services.AddRateLimiter(o =>
+{
+    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests; // <--- fuerza 429 en lugar de 503
+    o.AddFixedWindowLimiter("orders", options =>
+    {
+        options.PermitLimit = permitLimit;
+        options.Window = TimeSpan.FromSeconds(windowSecs);
+        options.QueueLimit = 5;
+        options.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+    });
+});
+
 var ordersPublishedTotal = Metrics.CreateCounter("orders_published_total", "Órdenes publicadas por la API");
 var app = builder.Build();
 
@@ -74,6 +91,7 @@ app.UseSwaggerUI();
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 app.UseHttpMetrics();          // métricas de peticiones HTTP
 app.MapMetrics("/metrics");    // endpoint de scrape para Prometheus
 
@@ -144,6 +162,7 @@ app.MapPost("/orders",
     Serilog.Log.Information("order_published {OrderId}", req.OrderId);
 
     return Results.Accepted($"/orders/{req.OrderId}", new { status = "queued", req.OrderId });
-});
+})
+.RequireRateLimiting("orders");
 
 app.Run();
