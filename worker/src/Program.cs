@@ -154,7 +154,7 @@ while (true)
                         {
                             Serilog.Log.Warning("invalid_payload_orderId_parse_error {Raw}", raw);
                             ch.BasicAck(ea.DeliveryTag, false);
-                            ordersFailedTotal.Inc();
+                            
                             return;
                         }
                     }
@@ -162,7 +162,7 @@ while (true)
                     {
                         Serilog.Log.Warning("invalid_payload_missing_orderId {Body}", json);
                         ch.BasicAck(ea.DeliveryTag, false);
-                        ordersFailedTotal.Inc();
+                        
                         return;
                     }
 
@@ -181,7 +181,7 @@ while (true)
                         {
                             Serilog.Log.Warning("invalid_payload_amount_parse_error {OrderId} {Raw}", orderId, amountEl.ToString());
                             ch.BasicAck(ea.DeliveryTag, false);
-                            ordersFailedTotal.Inc();
+                            
                             return;
                         }
                     }
@@ -189,7 +189,7 @@ while (true)
                     {
                         Serilog.Log.Warning("invalid_payload_missing_amount {OrderId}", orderId);
                         ch.BasicAck(ea.DeliveryTag, false);
-                        ordersFailedTotal.Inc();
+                        
                         return;
                     }
 
@@ -201,7 +201,7 @@ while (true)
                     {
                         Serilog.Log.Information("duplicate_ignored {Key}", key);
                         ch.BasicAck(ea.DeliveryTag, false);
-                        ordersFailedTotal.Inc();
+                        
                         return;
                     }
 
@@ -221,6 +221,7 @@ while (true)
                 {
                     Serilog.Log.Error(ex, "worker_error_to_dlq {Retry}", retries + 1);
                     ch.BasicReject(ea.DeliveryTag, requeue: false); // a DLQ
+                    ordersFailedTotal.Inc();
                 }
                 else
                 {
@@ -232,8 +233,7 @@ while (true)
 
                     // Re-publica y ACKea el original
                     ch.BasicPublish(exchange, routingKey, props, ea.Body);
-                    ch.BasicAck(ea.DeliveryTag, false);
-                    ordersFailedTotal.Inc();
+                    ch.BasicAck(ea.DeliveryTag, false);                    
                     Serilog.Log.Error(ex, "worker_error_retrying {Retry}", retries + 1);
                 }
             }
