@@ -3,8 +3,16 @@ using RabbitMQ.Client;
 using System.Text;
 using System.Text.Json;
 using Api.Contracts.Requests;
+using Serilog;
+
+// Logs JSON compactos (listos para ELK/DataDog)
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
+    .CreateLogger();
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Host.UseSerilog();
 
 // Swagger
 builder.Services.AddEndpointsApiExplorer();
@@ -55,6 +63,7 @@ app.MapPost("/orders", (CreateOrderRequest req, IModel ch) =>
         amount = req.Amount,
         createdAt = DateTime.UtcNow
     };
+    Serilog.Log.Information("order_received {OrderId} {Amount}", req.OrderId, req.Amount);
     var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope));
 
     var props = ch.CreateBasicProperties();
@@ -63,6 +72,7 @@ app.MapPost("/orders", (CreateOrderRequest req, IModel ch) =>
     props.MessageId = envelope.messageId.ToString();
 
     ch.BasicPublish("orders.exchange", "orders.created", props, body);
+    Serilog.Log.Information("order_published {OrderId}", req.OrderId);
     return Results.Accepted($"/orders/{req.OrderId}", new { status = "queued", req.OrderId });
 });
 
