@@ -6,14 +6,27 @@ using Microsoft.Extensions.Caching.Memory;
 using Serilog;
 using Serilog.Context;
 using System.Globalization;
+using Microsoft.AspNetCore.Builder;  // <-- para WebApplication, MapGet, MapMetrics
+using Microsoft.AspNetCore.Http;     // <-- para Results
+using Prometheus;  
 
 // ===== Logs JSON compactos =====
 Log.Logger = new LoggerConfiguration()
     .Enrich.FromLogContext()
     .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
     .CreateLogger();
-
+    
 Serilog.Log.Information("worker_starting");
+
+var ordersProcessedTotal = Metrics.CreateCounter("orders_processed_total", "Órdenes procesadas por el worker");
+var ordersFailedTotal    = Metrics.CreateCounter("orders_failed_total", "Órdenes enviadas a DLQ");
+
+var metricsBuilder = WebApplication.CreateBuilder();
+var metricsApp = metricsBuilder.Build();
+metricsApp.MapMetrics(); // expondrá /metrics
+_ = Task.Run(() => metricsApp.Run("http://0.0.0.0:8081"));
+Serilog.Log.Information("worker_metrics_endpoint_started port=8081");
+
 
 // ===== Config por entorno =====
 var host       = Environment.GetEnvironmentVariable("RABBITMQ__HOST") ?? "localhost";
@@ -141,6 +154,7 @@ while (true)
                         {
                             Serilog.Log.Warning("invalid_payload_orderId_parse_error {Raw}", raw);
                             ch.BasicAck(ea.DeliveryTag, false);
+                            ordersFailedTotal.Inc();
                             return;
                         }
                     }
@@ -148,6 +162,7 @@ while (true)
                     {
                         Serilog.Log.Warning("invalid_payload_missing_orderId {Body}", json);
                         ch.BasicAck(ea.DeliveryTag, false);
+                        ordersFailedTotal.Inc();
                         return;
                     }
 
@@ -166,6 +181,7 @@ while (true)
                         {
                             Serilog.Log.Warning("invalid_payload_amount_parse_error {OrderId} {Raw}", orderId, amountEl.ToString());
                             ch.BasicAck(ea.DeliveryTag, false);
+                            ordersFailedTotal.Inc();
                             return;
                         }
                     }
@@ -173,6 +189,7 @@ while (true)
                     {
                         Serilog.Log.Warning("invalid_payload_missing_amount {OrderId}", orderId);
                         ch.BasicAck(ea.DeliveryTag, false);
+                        ordersFailedTotal.Inc();
                         return;
                     }
 
@@ -184,6 +201,7 @@ while (true)
                     {
                         Serilog.Log.Information("duplicate_ignored {Key}", key);
                         ch.BasicAck(ea.DeliveryTag, false);
+                        ordersFailedTotal.Inc();
                         return;
                     }
 
@@ -191,6 +209,7 @@ while (true)
                     await Task.Delay(20);
 
                     ch.BasicAck(ea.DeliveryTag, false);
+                    ordersProcessedTotal.Inc();
                     Serilog.Log.Information("order_processed {OrderId}", orderId);
                 }
             }
@@ -214,6 +233,7 @@ while (true)
                     // Re-publica y ACKea el original
                     ch.BasicPublish(exchange, routingKey, props, ea.Body);
                     ch.BasicAck(ea.DeliveryTag, false);
+                    ordersFailedTotal.Inc();
                     Serilog.Log.Error(ex, "worker_error_retrying {Retry}", retries + 1);
                 }
             }
