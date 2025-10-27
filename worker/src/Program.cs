@@ -4,8 +4,10 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Memory;
 using Serilog;
+using Serilog.Context;
+using System.Globalization;
 
-// Logs JSON compactos
+// ===== Logs JSON compactos =====
 Log.Logger = new LoggerConfiguration()
     .Enrich.FromLogContext()
     .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
@@ -13,24 +15,25 @@ Log.Logger = new LoggerConfiguration()
 
 Serilog.Log.Information("worker_starting");
 
-var host = Environment.GetEnvironmentVariable("RABBITMQ__HOST") ?? "localhost";
-var user = Environment.GetEnvironmentVariable("RABBITMQ__USER") ?? "guest";
-var pass = Environment.GetEnvironmentVariable("RABBITMQ__PASS") ?? "guest";
-var prefetch = int.TryParse(Environment.GetEnvironmentVariable("WORKER__PREFETCH"), out var p) ? p : 10;
+// ===== Config por entorno =====
+var host       = Environment.GetEnvironmentVariable("RABBITMQ__HOST") ?? "localhost";
+var user       = Environment.GetEnvironmentVariable("RABBITMQ__USER") ?? "guest";
+var pass       = Environment.GetEnvironmentVariable("RABBITMQ__PASS") ?? "guest";
+var prefetch   = int.TryParse(Environment.GetEnvironmentVariable("WORKER__PREFETCH"), out var p) ? p : 10;
 var maxRetries = int.TryParse(Environment.GetEnvironmentVariable("WORKER__RETRYCOUNT"), out var r) ? r : 3;
 
-const string exchange = "orders.exchange";
-const string routingKey = "orders.created";
-const string queue = "orders.queue";
-const string dlx = "orders.dlx";
-const string dlq = "orders.dlq";
+const string exchange    = "orders.exchange";
+const string routingKey  = "orders.created";
+const string queue       = "orders.queue";
+const string dlx         = "orders.dlx";
+const string dlq         = "orders.dlq";
 
-// idempotencia simple con TTL
+// ===== Idempotencia simple con TTL =====
 var cache = new MemoryCache(new MemoryCacheOptions { SizeLimit = 10_000 });
-bool TryMark(string k)
+bool TryMark(string key)
 {
-    if (cache.TryGetValue(k, out _)) return false;
-    cache.Set(k, true, new MemoryCacheEntryOptions
+    if (cache.TryGetValue(key, out _)) return false;
+    cache.Set(key, true, new MemoryCacheEntryOptions
     {
         AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10),
         Size = 1
@@ -38,11 +41,38 @@ bool TryMark(string k)
     return true;
 }
 
+// ===== Helper: lectura robusta de x-retry =====
+static int GetRetryCount(IBasicProperties? props)
+{
+    try
+    {
+        if (props?.Headers is null) return 0;
+        if (!props.Headers.TryGetValue("x-retry", out var raw) || raw is null) return 0;
+
+        return raw switch
+        {
+            byte[] b                 => int.TryParse(Encoding.UTF8.GetString(b), out var i1) ? i1 : 0,
+            ReadOnlyMemory<byte> mem => int.TryParse(Encoding.UTF8.GetString(mem.ToArray()), out var i2) ? i2 : 0,
+            sbyte sb                 => (int)sb,
+            byte bb                  => (int)bb,
+            short s                  => (int)s,
+            ushort us                => (int)us,
+            int ii                   => ii,
+            uint ui                  => (int)ui,
+            long l                   => (int)l,
+            ulong ul                 => (int)ul,
+            string str               => int.TryParse(str, out var i3) ? i3 : 0,
+            _                        => 0
+        };
+    }
+    catch { return 0; }
+}
+
 while (true)
 {
     try
     {
-        var f = new ConnectionFactory
+        var factory = new ConnectionFactory
         {
             HostName = host,
             UserName = user,
@@ -50,71 +80,153 @@ while (true)
             DispatchConsumersAsync = true,
             AutomaticRecoveryEnabled = true
         };
-        using var conn = f.CreateConnection();
-        using var ch = conn.CreateModel();
 
+        using var conn = factory.CreateConnection();
+        using var ch   = conn.CreateModel();
+
+        // Topología
         ch.ExchangeDeclare(exchange, "topic", durable: true);
-        ch.ExchangeDeclare(dlx, "fanout", durable: true);
+        ch.ExchangeDeclare(dlx,      "fanout", durable: true);
+
         ch.QueueDeclare(dlq, durable: true, exclusive: false, autoDelete: false);
         ch.QueueBind(dlq, dlx, "");
 
         var qArgs = new Dictionary<string, object> { ["x-dead-letter-exchange"] = dlx };
         ch.QueueDeclare(queue, durable: true, exclusive: false, autoDelete: false, arguments: qArgs);
         ch.QueueBind(queue, exchange, routingKey);
+
         ch.BasicQos(0, (ushort)prefetch, false);
 
         var consumer = new AsyncEventingBasicConsumer(ch);
         consumer.Received += async (_, ea) =>
         {
             var json = Encoding.UTF8.GetString(ea.Body.ToArray());
+
             try
             {
-                var root = JsonDocument.Parse(json).RootElement;
-                var orderId = root.GetProperty("orderId").GetGuid().ToString();
-                var amount  = root.GetProperty("amount").GetDecimal();
+                using var doc  = JsonDocument.Parse(json);
+                var root       = doc.RootElement;
 
-                Serilog.Log.Information("order_processing {OrderId} {Amount}", orderId, amount);
+                // Envelope v1.0 o legacy
+                var payload = root.TryGetProperty("data", out var dataEl) ? dataEl : root;
 
-                var key = ea.BasicProperties?.MessageId ?? orderId;
-                if (!TryMark(key)) { ch.BasicAck(ea.DeliveryTag, false); return; }
+                // --- CorrelationId: payload -> props -> headers ---
+                string? correlationId = null;
+                if (root.TryGetProperty("correlationId", out var cidEl))
+                    correlationId = cidEl.GetString();
+                if (string.IsNullOrWhiteSpace(correlationId))
+                    correlationId = ea.BasicProperties?.CorrelationId;
+                if (string.IsNullOrWhiteSpace(correlationId)
+                    && ea.BasicProperties?.Headers != null
+                    && ea.BasicProperties.Headers.TryGetValue("X-Correlation-Id", out var rawCid))
+                {
+                    correlationId = rawCid switch
+                    {
+                        byte[] b                 => Encoding.UTF8.GetString(b),
+                        ReadOnlyMemory<byte> mem => Encoding.UTF8.GetString(mem.ToArray()),
+                        string s                 => s,
+                        _                        => null
+                    };
+                }
 
-                await Task.Delay(20); // simula trabajo
-                ch.BasicAck(ea.DeliveryTag, false);
+                using (LogContext.PushProperty("CorrelationId", correlationId ?? "n/a"))
+                {
+                    // --- orderId (camelCase o PascalCase) ---
+                    Guid orderId;
+                    if (payload.TryGetProperty("orderId", out var orderIdEl) ||
+                        payload.TryGetProperty("OrderId", out orderIdEl))
+                    {
+                        var raw = orderIdEl.ValueKind == JsonValueKind.String ? orderIdEl.GetString() : orderIdEl.ToString();
+                        if (!Guid.TryParse(raw, out orderId))
+                        {
+                            Serilog.Log.Warning("invalid_payload_orderId_parse_error {Raw}", raw);
+                            ch.BasicAck(ea.DeliveryTag, false);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        Serilog.Log.Warning("invalid_payload_missing_orderId {Body}", json);
+                        ch.BasicAck(ea.DeliveryTag, false);
+                        return;
+                    }
+
+                    // --- amount (camelCase o PascalCase) ---
+                    decimal amount;
+                    if (payload.TryGetProperty("amount", out var amountEl) ||
+                        payload.TryGetProperty("Amount", out amountEl))
+                    {
+                        try
+                        {
+                            amount = amountEl.ValueKind == JsonValueKind.Number
+                                ? amountEl.GetDecimal()
+                                : decimal.Parse(amountEl.ToString() ?? "0", CultureInfo.InvariantCulture);
+                        }
+                        catch
+                        {
+                            Serilog.Log.Warning("invalid_payload_amount_parse_error {OrderId} {Raw}", orderId, amountEl.ToString());
+                            ch.BasicAck(ea.DeliveryTag, false);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        Serilog.Log.Warning("invalid_payload_missing_amount {OrderId}", orderId);
+                        ch.BasicAck(ea.DeliveryTag, false);
+                        return;
+                    }
+
+                    // Log y idempotencia
+                    Serilog.Log.Information("order_processing {OrderId} {Amount}", orderId, amount);
+
+                    var key = ea.BasicProperties?.MessageId ?? orderId.ToString();
+                    if (!TryMark(key))
+                    {
+                        Serilog.Log.Information("duplicate_ignored {Key}", key);
+                        ch.BasicAck(ea.DeliveryTag, false);
+                        return;
+                    }
+
+                    // Simula trabajo
+                    await Task.Delay(20);
+
+                    ch.BasicAck(ea.DeliveryTag, false);
+                    Serilog.Log.Information("order_processed {OrderId}", orderId);
+                }
             }
             catch (Exception ex)
             {
-                var retries = 0;
-                if (ea.BasicProperties?.Headers != null &&
-                    ea.BasicProperties.Headers.TryGetValue("x-retry", out var rv) &&
-                    rv is byte[] b && int.TryParse(Encoding.UTF8.GetString(b), out var parsed))
-                {
-                    retries = parsed;
-                }
+                var retries = GetRetryCount(ea.BasicProperties);
 
                 if (retries + 1 >= maxRetries)
                 {
-                    Serilog.Log.Error(ex, "worker_error_retrying {Retry}", retries);
+                    Serilog.Log.Error(ex, "worker_error_to_dlq {Retry}", retries + 1);
                     ch.BasicReject(ea.DeliveryTag, requeue: false); // a DLQ
                 }
                 else
                 {
                     var props = ch.CreateBasicProperties();
-                    props.Headers = new Dictionary<string, object> { ["x-retry"] = retries + 1 };
+                    props.Headers ??= new Dictionary<string, object>();
+                    props.Headers["x-retry"] = retries + 1;
                     props.DeliveryMode = 2;
                     props.ContentType  = "application/json";
 
+                    // Re-publica y ACKea el original
                     ch.BasicPublish(exchange, routingKey, props, ea.Body);
                     ch.BasicAck(ea.DeliveryTag, false);
+                    Serilog.Log.Error(ex, "worker_error_retrying {Retry}", retries + 1);
                 }
             }
         };
 
         ch.BasicConsume(queue, autoAck: false, consumer);
+
+        // Mantener vivo
         await Task.Delay(Timeout.Infinite);
     }
-    catch
+    catch (Exception ex)
     {
+        Serilog.Log.Warning(ex, "worker_broker_connection_failed host={Host}", host);
         await Task.Delay(3000); // reconexión
-        Serilog.Log.Warning("worker_error_to_dlq {DeliveryTag}");
     }
 }
