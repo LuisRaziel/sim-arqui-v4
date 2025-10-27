@@ -8,13 +8,14 @@ using Microsoft.IdentityModel.JsonWebTokens;
 using System.Security.Claims;
 using System.Text;
 using Serilog;
+using Api.Middleware;
 
 // Logs JSON compactos (listos para ELK/DataDog)
 Log.Logger = new LoggerConfiguration()
     .Enrich.FromLogContext()
     .WriteTo.Console(new Serilog.Formatting.Compact.CompactJsonFormatter())
     .CreateLogger();
-    
+
 var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSerilog();
 
@@ -68,6 +69,7 @@ var app = builder.Build();
 
 app.UseSwagger();
 app.UseSwaggerUI();
+app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -99,28 +101,43 @@ app.MapMethods("/token", new[] { "GET", "POST" }, () =>
 });
 
 // POST /orders (sin auth todavía)
-app.MapPost("/orders", [Microsoft.AspNetCore.Authorization.Authorize](CreateOrderRequest req, IModel ch) =>
+app.MapPost("/orders",
+    [Microsoft.AspNetCore.Authorization.Authorize] (HttpContext ctx, CreateOrderRequest req, IModel ch) =>
 {
     if (req.OrderId == Guid.Empty || req.Amount <= 0)
         return Results.BadRequest(new { message = "Invalid payload" });
 
+    // 1) CorrelationId del middleware o header
+    var correlationId =
+        (ctx.Items["CorrelationId"] as string) ??
+        ctx.Request.Headers["X-Correlation-Id"].FirstOrDefault() ??
+        Guid.NewGuid().ToString("N");
+
+    // 2) Envelope con schema básico
     var envelope = new
     {
+        type = "OrderCreated",
+        schemaVersion = "1.0",
         messageId = Guid.NewGuid(),
-        orderId = req.OrderId,
-        amount = req.Amount,
-        createdAt = DateTime.UtcNow
+        correlationId,
+        timestamp = DateTime.UtcNow,
+        data = new { req.OrderId, req.Amount }
     };
-    Serilog.Log.Information("order_received {OrderId} {Amount}", req.OrderId, req.Amount);
     var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope));
 
+    // 3) AMQP props + headers con CorrelationId
     var props = ch.CreateBasicProperties();
     props.ContentType = "application/json";
-    props.DeliveryMode = 2; // persistente
+    props.DeliveryMode = 2;
     props.MessageId = envelope.messageId.ToString();
+    props.CorrelationId = correlationId;
+    props.Headers ??= new Dictionary<string, object>();
+    props.Headers["X-Correlation-Id"] = correlationId;
 
+    Serilog.Log.Information("order_received {OrderId} {Amount}", req.OrderId, req.Amount);
     ch.BasicPublish("orders.exchange", "orders.created", props, body);
     Serilog.Log.Information("order_published {OrderId}", req.OrderId);
+
     return Results.Accepted($"/orders/{req.OrderId}", new { status = "queued", req.OrderId });
 });
 
